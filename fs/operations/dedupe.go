@@ -4,7 +4,9 @@ package operations
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"path"
 	"sort"
 	"strings"
@@ -75,20 +77,86 @@ outer:
 }
 
 // dedupeDeleteAllButOne deletes all but the one in keep
-func dedupeDeleteAllButOne(ctx context.Context, keep int, remote string, objs []fs.Object) {
+//
+// If links is set each deleted object is replaced with a link to the
+// one kept.
+func dedupeDeleteAllButOne(ctx context.Context, f fs.Fs, keep int, remote string, objs []fs.Object, links bool) {
 	count := 0
 	for i, o := range objs {
 		if i == keep {
 			continue
 		}
-		err := DeleteFile(ctx, o)
+		var err error
+		if links {
+			err = dedupeReplaceWithLink(ctx, f, objs[keep], o)
+		} else {
+			err = DeleteFile(ctx, o)
+		}
 		if err == nil {
 			count++
 		}
 	}
-	if count > 0 {
+	if count > 0 && links {
+		fs.Logf(remote, "Replaced %d extra copies with links", count)
+	} else if count > 0 {
 		fs.Logf(remote, "Deleted %d extra copies", count)
 	}
+}
+
+// dedupeLinkTarget returns the path of target relative to the
+// directory containing remote, using "/" as the separator
+func dedupeLinkTarget(remote, target string) string {
+	from := strings.Split(path.Dir(remote), "/")
+	if from[0] == "." {
+		from = nil
+	}
+	to := strings.Split(target, "/")
+	common := 0
+	for common < len(from) && common < len(to)-1 && from[common] == to[common] {
+		common++
+	}
+	var parts []string
+	for range from[common:] {
+		parts = append(parts, "..")
+	}
+	parts = append(parts, to[common:]...)
+	return strings.Join(parts, "/")
+}
+
+// dedupeReplaceWithLink uploads a link to keep next to o then deletes o
+//
+// o is only deleted once the link has been uploaded. If an object
+// already exists where the link would go, it returns an error and
+// changes nothing.
+func dedupeReplaceWithLink(ctx context.Context, f fs.Fs, keep, o fs.Object) error {
+	if o.Remote() == keep.Remote() {
+		// A link can't point at its own name, and o is an identical copy
+		return DeleteFile(ctx, o)
+	}
+	linkRemote := o.Remote() + fs.LinkSuffix
+	_, err := f.NewObject(ctx, linkRemote)
+	if err == nil {
+		err = fmt.Errorf("%q already exists", linkRemote)
+	} else if errors.Is(err, fs.ErrorObjectNotFound) {
+		err = nil
+	}
+	if err != nil {
+		err = fs.CountError(ctx, err)
+		fs.Errorf(o, "Not replacing with link: %v", err)
+		return err
+	}
+	target := dedupeLinkTarget(o.Remote(), keep.Remote())
+	link, err := Rcat(ctx, f, linkRemote, io.NopCloser(strings.NewReader(target)), o.ModTime(ctx), nil)
+	if err != nil {
+		err = fs.CountError(ctx, err)
+		fs.Errorf(o, "Not deleting as link upload failed: %v", err)
+		return err
+	}
+	if link == nil && !fs.GetConfig(ctx).DryRun {
+		// The upload was declined with --interactive so o must stay
+		return nil
+	}
+	return DeleteFile(ctx, o)
 }
 
 // dedupeDeleteIdentical deletes all but one of identical (by hash) copies
@@ -177,7 +245,7 @@ func dedupeList(ctx context.Context, f fs.Fs, ht hash.Type, remote string, objs 
 }
 
 // dedupeInteractive interactively dedupes the slice of objects
-func dedupeInteractive(ctx context.Context, f fs.Fs, ht hash.Type, remote string, objs []fs.Object, byHash bool, files map[string][]fs.Object) bool {
+func dedupeInteractive(ctx context.Context, f fs.Fs, ht hash.Type, remote string, objs []fs.Object, byHash bool, links bool, files map[string][]fs.Object) bool {
 	dedupeList(ctx, f, ht, remote, objs, byHash)
 	commands := []string{"sSkip and do nothing", "kKeep just one (choose which in next step)"}
 	if !byHash {
@@ -188,7 +256,7 @@ func dedupeInteractive(ctx context.Context, f fs.Fs, ht hash.Type, remote string
 	case 's':
 	case 'k':
 		keep := config.ChooseNumber("Enter the number of the file to keep", 1, len(objs))
-		dedupeDeleteAllButOne(ctx, keep-1, remote, objs)
+		dedupeDeleteAllButOne(ctx, f, keep-1, remote, objs, links)
 	case 'r':
 		dedupeRename(ctx, f, remote, objs, files)
 	case 'q':
@@ -418,8 +486,18 @@ func sortSmallestFirst(objs []fs.Object) {
 // Deduplicate interactively finds duplicate files and offers to
 // delete all but one or rename them to be different. Only useful with
 // Google Drive which can have duplicate file names.
-func Deduplicate(ctx context.Context, f fs.Fs, mode DeduplicateMode, byHash bool) error {
+//
+// If links is set the duplicates which would be deleted are replaced
+// with links to the one kept instead. This needs byHash and can't be
+// used with DeduplicateRename.
+func Deduplicate(ctx context.Context, f fs.Fs, mode DeduplicateMode, byHash bool, links bool) error {
 	ci := fs.GetConfig(ctx)
+	if links && !byHash {
+		return errors.New("replacing duplicates with links needs --by-hash")
+	}
+	if links && mode == DeduplicateRename {
+		return errors.New("replacing duplicates with links can't be used with rename mode")
+	}
 	// find a hash to use
 	ht := f.Hashes().GetOne()
 	what := "names"
@@ -456,6 +534,11 @@ func Deduplicate(ctx context.Context, f fs.Fs, mode DeduplicateMode, byHash bool
 	files := map[string][]fs.Object{}
 	err := walk.ListR(ctx, f, "", false, ci.MaxDepth, walk.ListObjects, func(entries fs.DirEntries) error {
 		entries.ForObject(func(o fs.Object) {
+			if links && strings.HasSuffix(o.Remote(), fs.LinkSuffix) {
+				// Links made by an earlier run have the same hash
+				// as each other when they point at the same file
+				return
+			}
 			tr := accounting.Stats(ctx).NewCheckingTransfer(o, "checking")
 			defer tr.Done(ctx, nil)
 
@@ -497,25 +580,25 @@ func Deduplicate(ctx context.Context, f fs.Fs, mode DeduplicateMode, byHash bool
 		}
 		switch mode {
 		case DeduplicateInteractive:
-			if !dedupeInteractive(ctx, f, ht, remote, objs, byHash, files) {
+			if !dedupeInteractive(ctx, f, ht, remote, objs, byHash, links, files) {
 				return nil
 			}
 		case DeduplicateFirst:
-			dedupeDeleteAllButOne(ctx, 0, remote, objs)
+			dedupeDeleteAllButOne(ctx, f, 0, remote, objs, links)
 		case DeduplicateNewest:
 			sortOldestFirst(objs)
-			dedupeDeleteAllButOne(ctx, len(objs)-1, remote, objs)
+			dedupeDeleteAllButOne(ctx, f, len(objs)-1, remote, objs, links)
 		case DeduplicateOldest:
 			sortOldestFirst(objs)
-			dedupeDeleteAllButOne(ctx, 0, remote, objs)
+			dedupeDeleteAllButOne(ctx, f, 0, remote, objs, links)
 		case DeduplicateRename:
 			dedupeRename(ctx, f, remote, objs, files)
 		case DeduplicateLargest:
 			sortSmallestFirst(objs)
-			dedupeDeleteAllButOne(ctx, len(objs)-1, remote, objs)
+			dedupeDeleteAllButOne(ctx, f, len(objs)-1, remote, objs, links)
 		case DeduplicateSmallest:
 			sortSmallestFirst(objs)
-			dedupeDeleteAllButOne(ctx, 0, remote, objs)
+			dedupeDeleteAllButOne(ctx, f, 0, remote, objs, links)
 		case DeduplicateSkip:
 			fs.Logf(remote, "Skipping %d files with duplicate %s", len(objs), what)
 		case DeduplicateList:
