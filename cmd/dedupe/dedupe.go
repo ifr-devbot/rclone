@@ -154,6 +154,14 @@ rclone dedupe --by-hash --replace-with-links newest remote:path
 rclone copy -l remote:path /path/to/restore
 ` + "```" + `
 
+If the deduped files are on a local disk, ` + "`-l`" + ` makes rclone look for
+symlinks in the source instead of reading the ` + "`.rclonelink`" + ` files, so
+turn links on for the destination only, for example
+
+` + "```console" + `
+rclone copy /path/to/src ':local,links:/path/to/restore'
+` + "```" + `
+
 For example, to rename all the identically named photos in your Google Photos
 directory, do
 
