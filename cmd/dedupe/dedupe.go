@@ -13,8 +13,9 @@ import (
 )
 
 var (
-	dedupeMode = operations.DeduplicateInteractive
-	byHash     = false
+	dedupeMode       = operations.DeduplicateInteractive
+	byHash           = false
+	replaceWithLinks = false
 )
 
 func init() {
@@ -22,6 +23,7 @@ func init() {
 	cmdFlag := commandDefinition.Flags()
 	flags.FVarP(cmdFlag, &dedupeMode, "dedupe-mode", "", "Dedupe mode interactive|skip|first|newest|oldest|largest|smallest|rename", "")
 	flags.BoolVarP(cmdFlag, &byHash, "by-hash", "", false, "Find identical hashes rather than names", "")
+	flags.BoolVarP(cmdFlag, &replaceWithLinks, "replace-with-links", "", false, "Replace duplicates with .rclonelink files pointing at the kept copy (needs --by-hash)", "")
 }
 
 var commandDefinition = &cobra.Command{
@@ -132,6 +134,34 @@ or by using an extra parameter with the same value
 - ` + "`" + `--dedupe-mode rename` + "`" + ` - removes identical files then renames the rest to be different.
 - ` + "`" + `--dedupe-mode list` + "`" + ` - lists duplicate dirs and files only and changes nothing.
 
+When deduping by hash, ` + "`--replace-with-links`" + ` replaces each duplicate
+the mode would delete with a ` + "`.rclonelink`" + ` file pointing at the copy it
+keeps, so ` + "`dir/copy.jpg`" + ` becomes ` + "`dir/copy.jpg.rclonelink`" + `. The
+link holds the path of the kept copy relative to the directory of the
+duplicate, using ` + "`/`" + ` as the separator. The duplicate is only deleted
+once the link has been uploaded, and if a file already exists where the link
+would go, rclone reports an error and leaves the duplicate in place. Existing
+` + "`.rclonelink`" + ` files are ignored when looking for duplicates in this mode.
+` + "`--replace-with-links`" + ` needs ` + "`--by-hash`" + ` and can't be used with
+the ` + "`rename`" + ` mode.
+
+These links are specific to rclone, other programs see them as small text
+files. To turn them back into symlinks, copy them to a local disk with the
+` + "`-l`/`--links`" + ` flag, for example
+
+` + "```console" + `
+rclone dedupe --by-hash --replace-with-links newest remote:path
+rclone copy -l remote:path /path/to/restore
+` + "```" + `
+
+If the deduped files are on a local disk, ` + "`-l`" + ` makes rclone look for
+symlinks in the source instead of reading the ` + "`.rclonelink`" + ` files, so
+turn links on for the destination only, for example
+
+` + "```console" + `
+rclone copy /path/to/src ':local,links:/path/to/restore'
+` + "```" + `
+
 For example, to rename all the identically named photos in your Google Photos
 directory, do
 
@@ -162,7 +192,7 @@ rclone dedupe rename "drive:Google Photos"
 			fs.Logf(fdst, "Can't have duplicate names here. Perhaps you wanted --by-hash ? Continuing anyway.")
 		}
 		cmd.Run(false, false, command, func() error {
-			return operations.Deduplicate(context.Background(), fdst, dedupeMode, byHash)
+			return operations.Deduplicate(context.Background(), fdst, dedupeMode, byHash, replaceWithLinks)
 		})
 	},
 }
